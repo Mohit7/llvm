@@ -49,6 +49,10 @@ private:
   SDValue LowerFTRUNC(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerFRINT(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerFNEARBYINT(SDValue Op, SelectionDAG &DAG) const;
+
+  SDValue LowerFROUND32(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerFROUND64(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerFROUND(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerFFLOOR(SDValue Op, SelectionDAG &DAG) const;
 
   SDValue LowerINT_TO_FP64(SDValue Op, SelectionDAG &DAG, bool Signed) const;
@@ -129,6 +133,9 @@ public:
                              EVT ExtVT) const override;
 
   bool isLoadBitCastBeneficial(EVT, EVT) const override;
+  bool isCheapToSpeculateCttz() const override;
+  bool isCheapToSpeculateCtlz() const override;
+
   SDValue LowerReturn(SDValue Chain, CallingConv::ID CallConv,
                       bool isVarArg,
                       const SmallVectorImpl<ISD::OutputArg> &Outs,
@@ -163,6 +170,14 @@ public:
                          SelectionDAG &DAG) const;
 
   const char* getTargetNodeName(unsigned Opcode) const override;
+
+  SDValue getRsqrtEstimate(SDValue Operand,
+                           DAGCombinerInfo &DCI,
+                           unsigned &RefinementSteps,
+                           bool &UseOneConstNR) const override;
+  SDValue getRecipEstimate(SDValue Operand,
+                           DAGCombinerInfo &DCI,
+                           unsigned &RefinementSteps) const override;
 
   virtual SDNode *PostISelFolding(MachineSDNode *N,
                                   SelectionDAG &DAG) const {
@@ -234,6 +249,7 @@ enum {
   RSQ_LEGACY,
   RSQ_CLAMPED,
   LDEXP,
+  FP_CLASS,
   DOT4,
   BFE_U32, // Extract range of bits with zero extension to 32-bits.
   BFE_I32, // Extract range of bits with sign extension to 32-bits.

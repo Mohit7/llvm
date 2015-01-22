@@ -113,6 +113,9 @@ private:
 
   bool SelectVOP3Mods0Clamp(SDValue In, SDValue &Src, SDValue &SrcMods,
                             SDValue &Omod) const;
+  bool SelectVOP3Mods0Clamp0OMod(SDValue In, SDValue &Src, SDValue &SrcMods,
+                                 SDValue &Clamp,
+                                 SDValue &Omod) const;
 
   SDNode *SelectADD_SUB_I64(SDNode *N);
   SDNode *SelectDIV_SCALE(SDNode *N);
@@ -283,7 +286,7 @@ SDNode *AMDGPUDAGToDAGISel::Select(SDNode *N) {
         }
       }
       switch(NumVectorElts) {
-      case 1: RegClassID = UseVReg ? AMDGPU::VReg_32RegClassID :
+      case 1: RegClassID = UseVReg ? AMDGPU::VGPR_32RegClassID :
                                      AMDGPU::SReg_32RegClassID;
         break;
       case 2: RegClassID = UseVReg ? AMDGPU::VReg_64RegClassID :
@@ -959,16 +962,27 @@ bool AMDGPUDAGToDAGISel::SelectMUBUFScratch(SDValue Addr, SDValue &Rsrc,
   const SITargetLowering& Lowering =
     *static_cast<const SITargetLowering*>(getTargetLowering());
 
-  unsigned ScratchPtrReg =
-      TRI->getPreloadedValue(MF, SIRegisterInfo::SCRATCH_PTR);
   unsigned ScratchOffsetReg =
       TRI->getPreloadedValue(MF, SIRegisterInfo::SCRATCH_WAVE_OFFSET);
   Lowering.CreateLiveInRegister(*CurDAG, &AMDGPU::SReg_32RegClass,
                                 ScratchOffsetReg, MVT::i32);
+  SDValue Sym0 = CurDAG->getExternalSymbol("SCRATCH_RSRC_DWORD0", MVT::i32);
+  SDValue ScratchRsrcDword0 =
+      SDValue(CurDAG->getMachineNode(AMDGPU::S_MOV_B32, DL, MVT::i32, Sym0), 0);
 
-  SDValue ScratchPtr =
-    CurDAG->getCopyFromReg(CurDAG->getEntryNode(), DL,
-                           MRI.getLiveInVirtReg(ScratchPtrReg), MVT::i64);
+  SDValue Sym1 = CurDAG->getExternalSymbol("SCRATCH_RSRC_DWORD1", MVT::i32);
+  SDValue ScratchRsrcDword1 =
+      SDValue(CurDAG->getMachineNode(AMDGPU::S_MOV_B32, DL, MVT::i32, Sym1), 0);
+
+  const SDValue RsrcOps[] = {
+      CurDAG->getTargetConstant(AMDGPU::SReg_64RegClassID, MVT::i32),
+      ScratchRsrcDword0,
+      CurDAG->getTargetConstant(AMDGPU::sub0, MVT::i32),
+      ScratchRsrcDword1,
+      CurDAG->getTargetConstant(AMDGPU::sub1, MVT::i32),
+  };
+  SDValue ScratchPtr = SDValue(CurDAG->getMachineNode(AMDGPU::REG_SEQUENCE, DL,
+                                              MVT::v2i32, RsrcOps), 0);
   Rsrc = SDValue(Lowering.buildScratchRSRC(*CurDAG, DL, ScratchPtr), 0);
   SOffset = CurDAG->getCopyFromReg(CurDAG->getEntryNode(), DL,
       MRI.getLiveInVirtReg(ScratchOffsetReg), MVT::i32);
@@ -983,22 +997,6 @@ bool AMDGPUDAGToDAGISel::SelectMUBUFScratch(SDValue Addr, SDValue &Rsrc,
       ImmOffset = CurDAG->getTargetConstant(C1->getZExtValue(), MVT::i16);
       return true;
     }
-  }
-
-  // (add FI, n0)
-  if ((Addr.getOpcode() == ISD::ADD || Addr.getOpcode() == ISD::OR) &&
-       isa<FrameIndexSDNode>(Addr.getOperand(0))) {
-    VAddr = Addr.getOperand(1);
-    ImmOffset = Addr.getOperand(0);
-    return true;
-  }
-
-  // (FI)
-  if (isa<FrameIndexSDNode>(Addr)) {
-    VAddr = SDValue(CurDAG->getMachineNode(AMDGPU::V_MOV_B32_e32, DL, MVT::i32,
-                                          CurDAG->getConstant(0, MVT::i32)), 0);
-    ImmOffset = Addr;
-    return true;
   }
 
   // (node)
@@ -1083,7 +1081,9 @@ SDNode *AMDGPUDAGToDAGISel::SelectAddrSpaceCast(SDNode *N) {
   if (DestSize > SrcSize) {
     assert(SrcSize == 32 && DestSize == 64);
 
-    SDValue RC = CurDAG->getTargetConstant(AMDGPU::VSrc_64RegClassID, MVT::i32);
+    // FIXME: This is probably wrong, we should never be defining
+    // a register class with both VGPRs and SGPRs
+    SDValue RC = CurDAG->getTargetConstant(AMDGPU::VS_64RegClassID, MVT::i32);
 
     const SDValue Ops[] = {
       RC,
@@ -1140,6 +1140,14 @@ bool AMDGPUDAGToDAGISel::SelectVOP3Mods0Clamp(SDValue In, SDValue &Src,
   // FIXME: Handle Omod
   Omod = CurDAG->getTargetConstant(0, MVT::i32);
 
+  return SelectVOP3Mods(In, Src, SrcMods);
+}
+
+bool AMDGPUDAGToDAGISel::SelectVOP3Mods0Clamp0OMod(SDValue In, SDValue &Src,
+                                                   SDValue &SrcMods,
+                                                   SDValue &Clamp,
+                                                   SDValue &Omod) const {
+  Clamp = Omod = CurDAG->getTargetConstant(0, MVT::i32);
   return SelectVOP3Mods(In, Src, SrcMods);
 }
 

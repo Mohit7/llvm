@@ -404,22 +404,20 @@ ARMTargetLowering::ARMTargetLowering(const TargetMachine &TM)
     addRegisterClass(MVT::f64, &ARM::DPRRegClass);
   }
 
-  for (unsigned VT = (unsigned)MVT::FIRST_VECTOR_VALUETYPE;
-       VT <= (unsigned)MVT::LAST_VECTOR_VALUETYPE; ++VT) {
-    for (unsigned InnerVT = (unsigned)MVT::FIRST_VECTOR_VALUETYPE;
-         InnerVT <= (unsigned)MVT::LAST_VECTOR_VALUETYPE; ++InnerVT)
-      setTruncStoreAction((MVT::SimpleValueType)VT,
-                          (MVT::SimpleValueType)InnerVT, Expand);
-    setLoadExtAction(ISD::SEXTLOAD, (MVT::SimpleValueType)VT, Expand);
-    setLoadExtAction(ISD::ZEXTLOAD, (MVT::SimpleValueType)VT, Expand);
-    setLoadExtAction(ISD::EXTLOAD, (MVT::SimpleValueType)VT, Expand);
+  for (MVT VT : MVT::vector_valuetypes()) {
+    for (MVT InnerVT : MVT::vector_valuetypes()) {
+      setTruncStoreAction(VT, InnerVT, Expand);
+      setLoadExtAction(ISD::SEXTLOAD, VT, InnerVT, Expand);
+      setLoadExtAction(ISD::ZEXTLOAD, VT, InnerVT, Expand);
+      setLoadExtAction(ISD::EXTLOAD, VT, InnerVT, Expand);
+    }
 
-    setOperationAction(ISD::MULHS, (MVT::SimpleValueType)VT, Expand);
-    setOperationAction(ISD::SMUL_LOHI, (MVT::SimpleValueType)VT, Expand);
-    setOperationAction(ISD::MULHU, (MVT::SimpleValueType)VT, Expand);
-    setOperationAction(ISD::UMUL_LOHI, (MVT::SimpleValueType)VT, Expand);
+    setOperationAction(ISD::MULHS, VT, Expand);
+    setOperationAction(ISD::SMUL_LOHI, VT, Expand);
+    setOperationAction(ISD::MULHU, VT, Expand);
+    setOperationAction(ISD::UMUL_LOHI, VT, Expand);
 
-    setOperationAction(ISD::BSWAP, (MVT::SimpleValueType)VT, Expand);
+    setOperationAction(ISD::BSWAP, VT, Expand);
   }
 
   setOperationAction(ISD::ConstantFP, MVT::f32, Custom);
@@ -574,9 +572,11 @@ ARMTargetLowering::ARMTargetLowering(const TargetMachine &TM)
                   MVT::v4i16, MVT::v2i16,
                   MVT::v2i32};
     for (unsigned i = 0; i < 6; ++i) {
-      setLoadExtAction(ISD::EXTLOAD, Tys[i], Legal);
-      setLoadExtAction(ISD::ZEXTLOAD, Tys[i], Legal);
-      setLoadExtAction(ISD::SEXTLOAD, Tys[i], Legal);
+      for (MVT VT : MVT::integer_vector_valuetypes()) {
+        setLoadExtAction(ISD::EXTLOAD, VT, Tys[i], Legal);
+        setLoadExtAction(ISD::ZEXTLOAD, VT, Tys[i], Legal);
+        setLoadExtAction(ISD::SEXTLOAD, VT, Tys[i], Legal);
+      }
     }
   }
 
@@ -621,8 +621,10 @@ ARMTargetLowering::ARMTargetLowering(const TargetMachine &TM)
   computeRegisterProperties();
 
   // ARM does not have floating-point extending loads.
-  setLoadExtAction(ISD::EXTLOAD, MVT::f32, Expand);
-  setLoadExtAction(ISD::EXTLOAD, MVT::f16, Expand);
+  for (MVT VT : MVT::fp_valuetypes()) {
+    setLoadExtAction(ISD::EXTLOAD, VT, MVT::f32, Expand);
+    setLoadExtAction(ISD::EXTLOAD, VT, MVT::f16, Expand);
+  }
 
   // ... or truncating stores
   setTruncStoreAction(MVT::f64, MVT::f32, Expand);
@@ -630,7 +632,8 @@ ARMTargetLowering::ARMTargetLowering(const TargetMachine &TM)
   setTruncStoreAction(MVT::f64, MVT::f16, Expand);
 
   // ARM does not have i1 sign extending load.
-  setLoadExtAction(ISD::SEXTLOAD, MVT::i1, Promote);
+  for (MVT VT : MVT::integer_valuetypes())
+    setLoadExtAction(ISD::SEXTLOAD, VT, MVT::i1, Promote);
 
   // ARM supports all 4 flavors of integer indexed load / store.
   if (!Subtarget->isThumb1Only()) {
@@ -2026,7 +2029,9 @@ ARMTargetLowering::IsEligibleForTailCallOptimization(SDValue Callee,
   // cannot rely on the linker replacing the tail call with a return.
   if (GlobalAddressSDNode *G = dyn_cast<GlobalAddressSDNode>(Callee)) {
     const GlobalValue *GV = G->getGlobal();
-    if (GV->hasExternalWeakLinkage())
+    const Triple TT(getTargetMachine().getTargetTriple());
+    if (GV->hasExternalWeakLinkage() &&
+        (!TT.isOSWindows() || TT.isOSBinFormatELF() || TT.isOSBinFormatMachO()))
       return false;
   }
 
@@ -8577,7 +8582,8 @@ static SDValue PerformBFICombine(SDNode *N,
     unsigned InvMask = cast<ConstantSDNode>(N->getOperand(2))->getZExtValue();
     unsigned LSB = countTrailingZeros(~InvMask);
     unsigned Width = (32 - countLeadingZeros(~InvMask)) - LSB;
-    assert(Width < std::numeric_limits<unsigned>::digits &&
+    assert(Width <
+               static_cast<unsigned>(std::numeric_limits<unsigned>::digits) &&
            "undefined behavior");
     unsigned Mask = (1u << Width) - 1;
     unsigned Mask2 = N11C->getZExtValue();
@@ -8975,13 +8981,42 @@ static SDValue CombineBaseUpdate(SDNode *N,
       continue;
     }
 
+    EVT AlignedVecTy = VecTy;
+
+    // If this is a less-than-standard-aligned load/store, change the type to
+    // match the standard alignment.
+    // The alignment is overlooked when selecting _UPD variants; and it's
+    // easier to introduce bitcasts here than fix that.
+    // There are 3 ways to get to this base-update combine:
+    // - intrinsics: they are assumed to be properly aligned (to the standard
+    //   alignment of the memory type), so we don't need to do anything.
+    // - ARMISD::VLDx nodes: they are only generated from the aforementioned
+    //   intrinsics, so, likewise, there's nothing to do.
+    // - generic load/store instructions: the alignment is specified as an
+    //   explicit operand, rather than implicitly as the standard alignment
+    //   of the memory type (like the intrisics).  We need to change the
+    //   memory type to match the explicit alignment.  That way, we don't
+    //   generate non-standard-aligned ARMISD::VLDx nodes.
+    if (LSBaseSDNode *LSN = dyn_cast<LSBaseSDNode>(N)) {
+      unsigned Alignment = LSN->getAlignment();
+      if (Alignment == 0)
+        Alignment = 1;
+      if (Alignment < VecTy.getScalarSizeInBits() / 8) {
+        MVT EltTy = MVT::getIntegerVT(Alignment * 8);
+        assert(NumVecs == 1 && "Unexpected multi-element generic load/store.");
+        assert(!isLaneOp && "Unexpected generic load/store lane.");
+        unsigned NumElts = NumBytes / (EltTy.getSizeInBits() / 8);
+        AlignedVecTy = MVT::getVectorVT(EltTy, NumElts);
+      }
+    }
+
     // Create the new updating load/store node.
     // First, create an SDVTList for the new updating node's results.
     EVT Tys[6];
     unsigned NumResultVecs = (isLoad ? NumVecs : 0);
     unsigned n;
     for (n = 0; n < NumResultVecs; ++n)
-      Tys[n] = VecTy;
+      Tys[n] = AlignedVecTy;
     Tys[n++] = MVT::i32;
     Tys[n] = MVT::Other;
     SDVTList SDTys = DAG.getVTList(makeArrayRef(Tys, NumResultVecs+2));
@@ -8999,9 +9034,17 @@ static SDValue CombineBaseUpdate(SDNode *N,
       for (unsigned i = AddrOpIdx + 1; i < N->getNumOperands(); ++i)
         Ops.push_back(N->getOperand(i));
     }
+
+    // If this is a non-standard-aligned store, the penultimate operand is the
+    // stored value.  Bitcast it to the aligned type.
+    if (AlignedVecTy != VecTy && N->getOpcode() == ISD::STORE) {
+      SDValue &StVal = Ops[Ops.size()-2];
+      StVal = DAG.getNode(ISD::BITCAST, SDLoc(N), AlignedVecTy, StVal);
+    }
+
     MemSDNode *MemInt = cast<MemSDNode>(N);
     SDValue UpdN = DAG.getMemIntrinsicNode(NewOpc, SDLoc(N), SDTys,
-                                           Ops, MemInt->getMemoryVT(),
+                                           Ops, AlignedVecTy,
                                            MemInt->getMemOperand());
 
     // Update the uses.
@@ -9009,6 +9052,14 @@ static SDValue CombineBaseUpdate(SDNode *N,
     for (unsigned i = 0; i < NumResultVecs; ++i) {
       NewResults.push_back(SDValue(UpdN.getNode(), i));
     }
+
+    // If this is an non-standard-aligned load, the first result is the loaded
+    // value.  Bitcast it to the expected result type.
+    if (AlignedVecTy != VecTy && N->getOpcode() == ISD::LOAD) {
+      SDValue &LdVal = NewResults[0];
+      LdVal = DAG.getNode(ISD::BITCAST, SDLoc(N), VecTy, LdVal);
+    }
+
     NewResults.push_back(SDValue(UpdN.getNode(), NumResultVecs+1)); // chain
     DCI.CombineTo(N, NewResults);
     DCI.CombineTo(User, SDValue(UpdN.getNode(), NumResultVecs));
@@ -9205,9 +9256,7 @@ static SDValue PerformSTORECombine(SDNode *N,
 
     // Find the largest store unit
     MVT StoreType = MVT::i8;
-    for (unsigned tp = MVT::FIRST_INTEGER_VALUETYPE;
-         tp < MVT::LAST_INTEGER_VALUETYPE; ++tp) {
-      MVT Tp = (MVT::SimpleValueType)tp;
+    for (MVT Tp : MVT::integer_valuetypes()) {
       if (TLI.isTypeLegal(Tp) && Tp.getSizeInBits() <= NumElems * ToEltSz)
         StoreType = Tp;
     }
@@ -9355,16 +9404,18 @@ static SDValue PerformVCVTCombine(SDNode *N,
 
   MVT FloatTy = Op.getSimpleValueType().getVectorElementType();
   MVT IntTy = N->getSimpleValueType(0).getVectorElementType();
-  if (FloatTy.getSizeInBits() != 32 || IntTy.getSizeInBits() > 32) {
+  unsigned NumLanes = Op.getValueType().getVectorNumElements();
+  if (FloatTy.getSizeInBits() != 32 || IntTy.getSizeInBits() > 32 ||
+      NumLanes > 4) {
     // These instructions only exist converting from f32 to i32. We can handle
     // smaller integers by generating an extra truncate, but larger ones would
-    // be lossy.
+    // be lossy. We also can't handle more then 4 lanes, since these intructions
+    // only support v2i32/v4i32 types.
     return SDValue();
   }
 
   unsigned IntrinsicOpcode = isSigned ? Intrinsic::arm_neon_vcvtfp2fxs :
     Intrinsic::arm_neon_vcvtfp2fxu;
-  unsigned NumLanes = Op.getValueType().getVectorNumElements();
   SDValue FixConv =  DAG.getNode(ISD::INTRINSIC_WO_CHAIN, SDLoc(N),
                                  NumLanes == 2 ? MVT::v2i32 : MVT::v4i32,
                                  DAG.getConstant(IntrinsicOpcode, MVT::i32), N0,

@@ -234,10 +234,10 @@ bool ISD::allOperandsUndef(const SDNode *N) {
   return true;
 }
 
-ISD::NodeType ISD::getExtForLoadExtType(ISD::LoadExtType ExtType) {
+ISD::NodeType ISD::getExtForLoadExtType(bool IsFP, ISD::LoadExtType ExtType) {
   switch (ExtType) {
   case ISD::EXTLOAD:
-    return ISD::ANY_EXTEND;
+    return IsFP ? ISD::FP_EXTEND : ISD::ANY_EXTEND;
   case ISD::SEXTLOAD:
     return ISD::SIGN_EXTEND;
   case ISD::ZEXTLOAD:
@@ -3383,8 +3383,9 @@ SDValue SelectionDAG::getNode(unsigned Opcode, SDLoc DL, EVT VT, SDValue N1,
   }
 
   // Perform trivial constant folding.
-  SDValue SV = FoldConstantArithmetic(Opcode, VT, N1.getNode(), N2.getNode());
-  if (SV.getNode()) return SV;
+  if (SDValue SV =
+          FoldConstantArithmetic(Opcode, VT, N1.getNode(), N2.getNode()))
+    return SV;
 
   // Canonicalize constant to RHS if commutative.
   if (N1C && !N2C && isCommutativeBinOp(Opcode)) {
@@ -6553,11 +6554,25 @@ bool SelectionDAG::isConsecutiveLoad(LoadSDNode *LD, LoadSDNode *Base,
     return MFI->getObjectOffset(FI) == (MFI->getObjectOffset(BFI) + Dist*Bytes);
   }
 
-  // Handle X+C
-  if (isBaseWithConstantOffset(Loc) && Loc.getOperand(0) == BaseLoc &&
-      cast<ConstantSDNode>(Loc.getOperand(1))->getSExtValue() == Dist*Bytes)
-    return true;
-
+  // Handle X + C.
+  if (isBaseWithConstantOffset(Loc)) {
+    int64_t LocOffset = cast<ConstantSDNode>(Loc.getOperand(1))->getSExtValue();
+    if (Loc.getOperand(0) == BaseLoc) {
+      // If the base location is a simple address with no offset itself, then
+      // the second load's first add operand should be the base address.
+      if (LocOffset == Dist * (int)Bytes)
+        return true;
+    } else if (isBaseWithConstantOffset(BaseLoc)) {
+      // The base location itself has an offset, so subtract that value from the
+      // second load's offset before comparing to distance * size.
+      int64_t BOffset =
+        cast<ConstantSDNode>(BaseLoc.getOperand(1))->getSExtValue();
+      if (Loc.getOperand(0) == BaseLoc.getOperand(0)) {
+        if ((LocOffset - BOffset) == Dist * (int)Bytes)
+          return true;
+      }
+    }
+  }
   const GlobalValue *GV1 = nullptr;
   const GlobalValue *GV2 = nullptr;
   int64_t Offset1 = 0;

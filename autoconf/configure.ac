@@ -32,10 +32,10 @@ dnl===-----------------------------------------------------------------------===
 dnl Initialize autoconf and define the package name, version number and
 dnl address for reporting bugs.
 
-AC_INIT([LLVM],[3.6.0svn],[http://llvm.org/bugs/])
+AC_INIT([LLVM],[3.7.0svn],[http://llvm.org/bugs/])
 
 LLVM_VERSION_MAJOR=3
-LLVM_VERSION_MINOR=6
+LLVM_VERSION_MINOR=7
 LLVM_VERSION_PATCH=0
 LLVM_VERSION_SUFFIX=svn
 
@@ -2017,6 +2017,11 @@ if test "${clang_src_root}" = ""; then
   clang_src_root="$srcdir/tools/clang"
 fi
 if test -f ${clang_src_root}/README.txt; then
+  dnl Clang supports build systems which use the multilib libdir suffix.
+  dnl The autoconf system doesn't support this so stub out that variable.
+  AC_DEFINE_UNQUOTED(CLANG_LIBDIR_SUFFIX,"",
+                     [Multilib suffix for libdir.])
+
   dnl Use variables to stay under 80 columns.
   configh="include/clang/Config/config.h"
   doxy="docs/doxygen.cfg"

@@ -18,10 +18,10 @@
 #define LLVM_IR_DEBUGINFO_H
 
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/iterator_range.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/iterator_range.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Dwarf.h"
@@ -59,14 +59,14 @@ class DIObjCProperty;
 typedef DenseMap<const MDString *, MDNode *> DITypeIdentifierMap;
 
 class DIHeaderFieldIterator
-    : public std::iterator<std::input_iterator_tag, StringRef, std::ptrdiff_t,
+    : public std::iterator<std::forward_iterator_tag, StringRef, std::ptrdiff_t,
                            const StringRef *, StringRef> {
   StringRef Header;
   StringRef Current;
 
 public:
   DIHeaderFieldIterator() {}
-  DIHeaderFieldIterator(StringRef Header)
+  explicit DIHeaderFieldIterator(StringRef Header)
       : Header(Header), Current(Header.slice(0, Header.find('\0'))) {}
   StringRef operator*() const { return Current; }
   const StringRef * operator->() const { return &Current; }
@@ -97,6 +97,16 @@ public:
     if (Current.end() == Header.end())
       return StringRef();
     return Header.slice(Current.end() - Header.begin() + 1, StringRef::npos);
+  }
+
+  /// \brief Get the current field as a number.
+  ///
+  /// Convert the current field into a number.  Return \c 0 on error.
+  template <class T> T getNumber() const {
+    T Int;
+    if (getCurrent().getAsInteger(0, Int))
+      return 0;
+    return Int;
   }
 
 private:
@@ -138,9 +148,8 @@ public:
     FlagObjectPointer     = 1 << 10,
     FlagVector            = 1 << 11,
     FlagStaticMember      = 1 << 12,
-    FlagIndirectVariable  = 1 << 13,
-    FlagLValueReference   = 1 << 14,
-    FlagRValueReference   = 1 << 15
+    FlagLValueReference   = 1 << 13,
+    FlagRValueReference   = 1 << 14
   };
 
 protected:
@@ -191,20 +200,26 @@ public:
                          DIHeaderFieldIterator());
   }
 
-  StringRef getHeaderField(unsigned Index) const {
+  DIHeaderFieldIterator header_begin() const {
+    return DIHeaderFieldIterator(getHeader());
+  }
+  DIHeaderFieldIterator header_end() const { return DIHeaderFieldIterator(); }
+
+  DIHeaderFieldIterator getHeaderIterator(unsigned Index) const {
     // Since callers expect an empty string for out-of-range accesses, we can't
     // use std::advance() here.
-    for (DIHeaderFieldIterator I(getHeader()), E; I != E; ++I, --Index)
+    for (auto I = header_begin(), E = header_end(); I != E; ++I, --Index)
       if (!Index)
-        return *I;
-    return StringRef();
+        return I;
+    return header_end();
+  }
+
+  StringRef getHeaderField(unsigned Index) const {
+    return *getHeaderIterator(Index);
   }
 
   template <class T> T getHeaderFieldAs(unsigned Index) const {
-    T Int;
-    if (getHeaderField(Index).getAsInteger(0, Int))
-      return 0;
-    return Int;
+    return getHeaderIterator(Index).getNumber<T>();
   }
 
   uint16_t getTag() const { return getHeaderFieldAs<uint16_t>(0); }
@@ -500,6 +515,7 @@ public:
 // FIXME: Make this derive from DIType directly & just store the
 // base type in a single DIType field.
 class DICompositeType : public DIDerivedType {
+  friend class DIBuilder;
   friend class DIDescriptor;
   void printInternal(raw_ostream &OS) const;
 
@@ -513,6 +529,8 @@ public:
     assert(!isSubroutineType() && "no elements for DISubroutineType");
     return getFieldAs<DIArray>(4);
   }
+
+private:
   template <typename T>
   void setArrays(DITypedArray<T> Elements, DIArray TParams = DIArray()) {
     assert((!TParams || DbgNode->getNumOperands() == 8) &&
@@ -520,13 +538,18 @@ public:
            "for that!");
     setArraysHelper(Elements, TParams);
   }
+
+public:
   unsigned getRunTimeLang() const {
     return getHeaderFieldAs<unsigned>(7);
   }
   DITypeRef getContainingType() const { return getFieldAs<DITypeRef>(5); }
 
+private:
   /// \brief Set the containing type.
   void setContainingType(DICompositeType ContainingType);
+
+public:
   DIArray getTemplateParams() const { return getFieldAs<DIArray>(6); }
   MDString *getIdentifier() const;
 
@@ -808,11 +831,6 @@ public:
     return (getHeaderFieldAs<unsigned>(3) & FlagObjectPointer) != 0;
   }
 
-  /// \brief Return true if this variable is represented as a pointer.
-  bool isIndirect() const {
-    return (getHeaderFieldAs<unsigned>(3) & FlagIndirectVariable) != 0;
-  }
-
   /// \brief If this variable is inlined then return inline location.
   MDNode *getInlinedAt() const;
 
@@ -831,6 +849,8 @@ public:
 
   void printExtendedName(raw_ostream &OS) const;
 };
+
+class DIExpressionIterator;
 
 /// \brief A complex location expression.
 class DIExpression : public DIDescriptor {
@@ -860,7 +880,57 @@ public:
   uint64_t getPieceOffset() const;
   /// \brief Return the size of this piece in bytes.
   uint64_t getPieceSize() const;
+
+  DIExpressionIterator begin() const;
+  DIExpressionIterator end() const;
 };
+
+/// \brief An iterator for DIExpression elments.
+class DIExpressionIterator
+    : public std::iterator<std::forward_iterator_tag, StringRef, unsigned,
+                           const uint64_t *, uint64_t> {
+  DIHeaderFieldIterator I;
+  DIExpressionIterator(DIHeaderFieldIterator I) : I(I) {}
+public:
+  DIExpressionIterator() {}
+  DIExpressionIterator(const DIExpression &Expr) : I(++Expr.header_begin()) {}
+  uint64_t operator*() const { return I.getNumber<uint64_t>(); }
+  DIExpressionIterator &operator++() {
+    increment();
+    return *this;
+  }
+  DIExpressionIterator operator++(int) {
+    DIExpressionIterator X(*this);
+    increment();
+    return X;
+  }
+  bool operator==(const DIExpressionIterator &X) const {
+    return I == X.I;
+  }
+  bool operator!=(const DIExpressionIterator &X) const {
+    return !(*this == X);
+  }
+
+  uint64_t getArg(unsigned N) const {
+    auto In = I;
+    std::advance(In, N);
+    return In.getNumber<uint64_t>();
+  }
+
+  const DIHeaderFieldIterator& getBase() const { return I; }
+
+private:
+  void increment() {
+    switch (**this) {
+    case dwarf::DW_OP_piece: std::advance(I, 3); break;
+    case dwarf::DW_OP_plus:  std::advance(I, 2); break;
+    case dwarf::DW_OP_deref: std::advance(I, 1); break;
+    default:
+      assert("unsupported operand");
+    }
+  }
+};
+
 
 /// \brief This object holds location information.
 ///
@@ -869,10 +939,26 @@ class DILocation : public DIDescriptor {
 public:
   explicit DILocation(const MDNode *N) : DIDescriptor(N) {}
 
-  unsigned getLineNumber() const { return getUnsignedField(0); }
-  unsigned getColumnNumber() const { return getUnsignedField(1); }
-  DIScope getScope() const { return getFieldAs<DIScope>(2); }
-  DILocation getOrigLocation() const { return getFieldAs<DILocation>(3); }
+  unsigned getLineNumber() const {
+    if (auto *L = dyn_cast_or_null<MDLocation>(DbgNode))
+      return L->getLine();
+    return 0;
+  }
+  unsigned getColumnNumber() const {
+    if (auto *L = dyn_cast_or_null<MDLocation>(DbgNode))
+      return L->getColumn();
+    return 0;
+  }
+  DIScope getScope() const {
+    if (auto *L = dyn_cast_or_null<MDLocation>(DbgNode))
+      return DIScope(dyn_cast_or_null<MDNode>(L->getScope()));
+    return DIScope(nullptr);
+  }
+  DILocation getOrigLocation() const {
+    if (auto *L = dyn_cast_or_null<MDLocation>(DbgNode))
+      return DILocation(dyn_cast_or_null<MDNode>(L->getInlinedAt()));
+    return DILocation(nullptr);
+  }
   StringRef getFilename() const { return getScope().getFilename(); }
   StringRef getDirectory() const { return getScope().getDirectory(); }
   bool Verify() const;
@@ -893,7 +979,9 @@ public:
     // sure this location is a lexical block before retrieving its
     // value.
     return getScope().isLexicalBlockFile()
-               ? getFieldAs<DILexicalBlockFile>(2).getDiscriminator()
+               ? DILexicalBlockFile(
+                     cast<MDNode>(cast<MDLocation>(DbgNode)->getScope()))
+                     .getDiscriminator()
                : 0;
   }
 
@@ -1015,6 +1103,9 @@ public:
   void processValue(const Module &M, const DbgValueInst *DVI);
   /// \brief Process DILocation.
   void processLocation(const Module &M, DILocation Loc);
+
+  /// \brief Process DIExpression.
+  void processExpression(DIExpression Expr);
 
   /// \brief Clear all lists.
   void reset();

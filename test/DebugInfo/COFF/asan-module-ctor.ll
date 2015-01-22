@@ -13,6 +13,9 @@
 ; X86-NEXT: calll   ___asan_init_v3
 ; X86-NEXT: retl
 
+; Make sure we don't put any DWARF debug info for ASan-instrumented modules.
+; X86-NOT: DWARF
+
 ; ModuleID = 'asan.c'
 target datalayout = "e-m:w-p:32:32-i64:64-f80:32-n8:16:32-S32"
 target triple = "i686-pc-win32"
@@ -88,4 +91,4 @@ attributes #0 = { nounwind sanitize_address "less-precise-fpmad"="false" "no-fra
 !7 = !{i32 2, !"Dwarf Version", i32 4}
 !8 = !{i32 1, !"Debug Info Version", i32 2}
 !9 = !{!"clang version 3.5.0 "}
-!10 = !{i32 2, i32 0, !4, null}
+!10 = !MDLocation(line: 2, scope: !4)

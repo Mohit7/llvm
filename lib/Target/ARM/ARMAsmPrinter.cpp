@@ -57,6 +57,13 @@ using namespace llvm;
 
 #define DEBUG_TYPE "asm-printer"
 
+ARMAsmPrinter::ARMAsmPrinter(TargetMachine &TM,
+                             std::unique_ptr<MCStreamer> Streamer)
+    : AsmPrinter(TM, std::move(Streamer)), AFI(nullptr), MCP(nullptr),
+      InConstantPool(false) {
+  Subtarget = &TM.getSubtarget<ARMSubtarget>();
+}
+
 void ARMAsmPrinter::EmitFunctionBodyEnd() {
   // Make sure to terminate any constant pools that were at the end
   // of the function.
@@ -628,6 +635,8 @@ static ARMBuildAttrs::CPUArch getArchForCPU(StringRef CPU,
 void ARMAsmPrinter::emitAttributes() {
   MCTargetStreamer &TS = *OutStreamer.getTargetStreamer();
   ARMTargetStreamer &ATS = static_cast<ARMTargetStreamer &>(TS);
+
+  ATS.emitTextAttribute(ARMBuildAttrs::conformance, "2.09");
 
   ATS.switchVendor("aeabi");
 

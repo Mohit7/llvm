@@ -12,8 +12,8 @@
 #include "MipsRegisterInfo.h"
 #include "MipsTargetStreamer.h"
 #include "llvm/ADT/APInt.h"
-#include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
@@ -26,8 +26,8 @@
 #include "llvm/MC/MCTargetAsmParser.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
-#include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/TargetRegistry.h"
 #include <memory>
 
 using namespace llvm;
@@ -147,6 +147,9 @@ class MipsAsmParser : public MCTargetAsmParser {
   MipsAsmParser::OperandMatchResultTy parseLSAImm(OperandVector &Operands);
 
   MipsAsmParser::OperandMatchResultTy
+  parseRegisterPair (OperandVector &Operands);
+
+  MipsAsmParser::OperandMatchResultTy
   parseRegisterList (OperandVector  &Operands);
 
   bool searchSymbolAlias(OperandVector &Operands);
@@ -168,6 +171,8 @@ class MipsAsmParser : public MCTargetAsmParser {
 
   bool expandLoadAddressReg(MCInst &Inst, SMLoc IDLoc,
                             SmallVectorImpl<MCInst> &Instructions);
+  bool expandUncondBranchMMPseudo(MCInst &Inst, SMLoc IDLoc,
+                                  SmallVectorImpl<MCInst> &Instructions);
 
   void expandLoadAddressSym(MCInst &Inst, SMLoc IDLoc,
                             SmallVectorImpl<MCInst> &Instructions);
@@ -428,7 +433,8 @@ private:
     k_PhysRegister,  /// A physical register from the Mips namespace
     k_RegisterIndex, /// A register index in one or more RegKind.
     k_Token,         /// A simple token
-    k_RegList        /// A physical register list
+    k_RegList,       /// A physical register list
+    k_RegPair        /// A pair of physical register
   } Kind;
 
 public:
@@ -781,6 +787,13 @@ public:
       Inst.addOperand(MCOperand::CreateReg(RegNo));
   }
 
+  void addRegPairOperands(MCInst &Inst, unsigned N) const {
+    assert(N == 2 && "Invalid number of operands!");
+    unsigned RegNo = getRegPair();
+    Inst.addOperand(MCOperand::CreateReg(RegNo++));
+    Inst.addOperand(MCOperand::CreateReg(RegNo));
+  }
+
   bool isReg() const override {
     // As a special case until we sort out the definition of div/divu, pretend
     // that $0/$zero are k_PhysRegister so that MCK_ZERO works correctly.
@@ -812,6 +825,11 @@ public:
   template <unsigned Bits> bool isMemWithUimmOffsetSP() const {
     return isMem() && isConstantMemOff() && isUInt<Bits>(getConstantMemOff())
       && getMemBase()->isRegIdx() && (getMemBase()->getGPR32Reg() == Mips::SP);
+  }
+  template <unsigned Bits> bool isMemWithUimmWordAlignedOffsetSP() const {
+    return isMem() && isConstantMemOff() && isUInt<Bits>(getConstantMemOff())
+      && (getConstantMemOff() % 4 == 0) && getMemBase()->isRegIdx()
+      && (getMemBase()->getGPR32Reg() == Mips::SP);
   }
   bool isRegList16() const {
     if (!isRegList())
@@ -845,6 +863,7 @@ public:
     assert(Kind == k_Token && "Invalid access!");
     return StringRef(Tok.Data, Tok.Length);
   }
+  bool isRegPair() const { return Kind == k_RegPair; }
 
   unsigned getReg() const override {
     // As a special case until we sort out the definition of div/divu, pretend
@@ -884,6 +903,11 @@ public:
   const SmallVectorImpl<unsigned> &getRegList() const {
     assert((Kind == k_RegList) && "Invalid access!");
     return *(RegList.List);
+  }
+
+  unsigned getRegPair() const {
+    assert((Kind == k_RegPair) && "Invalid access!");
+    return RegIdx.Index;
   }
 
   static std::unique_ptr<MipsOperand> CreateToken(StringRef Str, SMLoc S,
@@ -995,6 +1019,15 @@ public:
     return Op;
   }
 
+  static std::unique_ptr<MipsOperand>
+  CreateRegPair(unsigned RegNo, SMLoc S, SMLoc E, MipsAsmParser &Parser) {
+    auto Op = make_unique<MipsOperand>(k_RegPair, Parser);
+    Op->RegIdx.Index = RegNo;
+    Op->StartLoc = S;
+    Op->EndLoc = E;
+    return Op;
+  }
+
   bool isGPRAsmReg() const {
     return isRegIdx() && RegIdx.Kind & RegKind_GPR && RegIdx.Index <= 31;
   }
@@ -1061,6 +1094,7 @@ public:
     case k_PhysRegister:
     case k_RegisterIndex:
     case k_Token:
+    case k_RegPair:
       break;
     }
   }
@@ -1093,6 +1127,9 @@ public:
       for (auto Reg : (*RegList.List))
         OS << Reg << " ";
       OS <<  ">";
+      break;
+    case k_RegPair:
+      OS << "RegPair<" << RegIdx.Index << "," << RegIdx.Index + 1 << ">";
       break;
     }
   }
@@ -1170,6 +1207,17 @@ bool MipsAsmParser::processInstruction(MCInst &Inst, SMLoc IDLoc,
         return Error(IDLoc, "branch target out of range");
       if (OffsetToAlignment(Offset.getImm(),
                             1LL << (inMicroMipsMode() ? 1 : 2)))
+        return Error(IDLoc, "branch to misaligned address");
+      break;
+    case Mips::BEQZ16_MM:
+    case Mips::BNEZ16_MM:
+      assert(MCID.getNumOperands() == 2 && "unexpected number of operands");
+      Offset = Inst.getOperand(1);
+      if (!Offset.isImm())
+        break; // We'll deal with this situation later on when applying fixups.
+      if (!isIntN(8, Offset.getImm()))
+        return Error(IDLoc, "branch target out of range");
+      if (OffsetToAlignment(Offset.getImm(), 2LL))
         return Error(IDLoc, "branch to misaligned address");
       break;
     }
@@ -1341,6 +1389,23 @@ bool MipsAsmParser::processInstruction(MCInst &Inst, SMLoc IDLoc,
         if (Imm < 0 || Imm > 60 || (Imm % 4 != 0))
           return Error(IDLoc, "immediate operand value out of range");
         break;
+      case Mips::CACHE:
+      case Mips::PREF:
+        Opnd = Inst.getOperand(2);
+        if (!Opnd.isImm())
+          return Error(IDLoc, "expected immediate operand kind");
+        Imm = Opnd.getImm();
+        if (!isUInt<5>(Imm))
+          return Error(IDLoc, "immediate operand value out of range");
+        break;
+      case Mips::ADDIUPC_MM:
+        MCOperand Opnd = Inst.getOperand(1);
+        if (!Opnd.isImm())
+          return Error(IDLoc, "expected immediate operand kind");
+        int Imm = Opnd.getImm();
+        if ((Imm % 4 != 0) || !isIntN(25, Imm))
+          return Error(IDLoc, "immediate operand value out of range");
+        break;
     }
   }
 
@@ -1359,6 +1424,7 @@ bool MipsAsmParser::needsExpansion(MCInst &Inst) {
   case Mips::LoadAddr32Imm:
   case Mips::LoadAddr32Reg:
   case Mips::LoadImm64Reg:
+  case Mips::B_MM_Pseudo:
     return true;
   default:
     return false;
@@ -1368,9 +1434,7 @@ bool MipsAsmParser::needsExpansion(MCInst &Inst) {
 bool MipsAsmParser::expandInstruction(MCInst &Inst, SMLoc IDLoc,
                                       SmallVectorImpl<MCInst> &Instructions) {
   switch (Inst.getOpcode()) {
-  default:
-    assert(0 && "unimplemented expansion");
-    return true;
+  default: llvm_unreachable("unimplemented expansion");
   case Mips::LoadImm32Reg:
     return expandLoadImm(Inst, IDLoc, Instructions);
   case Mips::LoadImm64Reg:
@@ -1383,6 +1447,8 @@ bool MipsAsmParser::expandInstruction(MCInst &Inst, SMLoc IDLoc,
     return expandLoadAddressImm(Inst, IDLoc, Instructions);
   case Mips::LoadAddr32Reg:
     return expandLoadAddressReg(Inst, IDLoc, Instructions);
+  case Mips::B_MM_Pseudo:
+    return expandUncondBranchMMPseudo(Inst, IDLoc, Instructions);
   }
 }
 
@@ -1668,6 +1734,51 @@ MipsAsmParser::expandLoadAddressSym(MCInst &Inst, SMLoc IDLoc,
   }
 }
 
+bool MipsAsmParser::
+expandUncondBranchMMPseudo(MCInst &Inst, SMLoc IDLoc,
+                           SmallVectorImpl<MCInst> &Instructions) {
+  const MCInstrDesc &MCID = getInstDesc(Inst.getOpcode());
+
+  assert(MCID.getNumOperands() == 1 && "unexpected number of operands");
+
+  MCOperand Offset = Inst.getOperand(0);
+  if (Offset.isExpr()) {
+    Inst.clear();
+    Inst.setOpcode(Mips::BEQ_MM);
+    Inst.addOperand(MCOperand::CreateReg(Mips::ZERO));
+    Inst.addOperand(MCOperand::CreateReg(Mips::ZERO));
+    Inst.addOperand(MCOperand::CreateExpr(Offset.getExpr()));
+  } else {
+    assert(Offset.isImm() && "expected immediate operand kind");
+    if (isIntN(11, Offset.getImm())) {
+      // If offset fits into 11 bits then this instruction becomes microMIPS
+      // 16-bit unconditional branch instruction.
+      Inst.setOpcode(Mips::B16_MM);
+    } else {
+      if (!isIntN(17, Offset.getImm()))
+        Error(IDLoc, "branch target out of range");
+      if (OffsetToAlignment(Offset.getImm(), 1LL << 1))
+        Error(IDLoc, "branch to misaligned address");
+      Inst.clear();
+      Inst.setOpcode(Mips::BEQ_MM);
+      Inst.addOperand(MCOperand::CreateReg(Mips::ZERO));
+      Inst.addOperand(MCOperand::CreateReg(Mips::ZERO));
+      Inst.addOperand(MCOperand::CreateImm(Offset.getImm()));
+    }
+  }
+  Instructions.push_back(Inst);
+
+  if (AssemblerOptions.back()->isReorder()) {
+    // If .set reorder is active, emit a NOP after the branch instruction.
+    MCInst NopInst;
+    NopInst.setOpcode(Mips::MOVE16_MM);
+    NopInst.addOperand(MCOperand::CreateReg(Mips::ZERO));
+    NopInst.addOperand(MCOperand::CreateReg(Mips::ZERO));
+    Instructions.push_back(NopInst);
+  }
+  return false;
+}
+
 void MipsAsmParser::expandMemInst(MCInst &Inst, SMLoc IDLoc,
                                   SmallVectorImpl<MCInst> &Instructions,
                                   bool isLoad, bool isImmOpnd) {
@@ -1808,8 +1919,6 @@ bool MipsAsmParser::MatchAndEmitInstruction(SMLoc IDLoc, unsigned &Opcode,
       MatchInstructionImpl(Operands, Inst, ErrorInfo, MatchingInlineAsm);
 
   switch (MatchResult) {
-  default:
-    break;
   case Match_Success: {
     if (processInstruction(Inst, IDLoc, Instructions))
       return true;
@@ -1838,7 +1947,8 @@ bool MipsAsmParser::MatchAndEmitInstruction(SMLoc IDLoc, unsigned &Opcode,
   case Match_RequiresDifferentSrcAndDst:
     return Error(IDLoc, "source and destination must be different");
   }
-  return true;
+
+  llvm_unreachable("Implement any new match types added!");
 }
 
 void MipsAsmParser::warnIfAssemblerTemporary(int RegIndex, SMLoc Loc) {
@@ -2720,6 +2830,22 @@ MipsAsmParser::parseRegisterList(OperandVector &Operands) {
   SMLoc E = Parser.getTok().getLoc();
   Operands.push_back(MipsOperand::CreateRegList(Regs, S, E, *this));
   parseMemOperand(Operands);
+  return MatchOperand_Success;
+}
+
+MipsAsmParser::OperandMatchResultTy
+MipsAsmParser::parseRegisterPair(OperandVector &Operands) {
+  MCAsmParser &Parser = getParser();
+
+  SMLoc S = Parser.getTok().getLoc();
+  if (parseAnyRegister(Operands) != MatchOperand_Success)
+    return MatchOperand_ParseFail;
+
+  SMLoc E = Parser.getTok().getLoc();
+  MipsOperand &Op = static_cast<MipsOperand &>(*Operands.back());
+  unsigned Reg = Op.getGPR32Reg();
+  Operands.pop_back();
+  Operands.push_back(MipsOperand::CreateRegPair(Reg, S, E, *this));
   return MatchOperand_Success;
 }
 
