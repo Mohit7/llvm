@@ -302,6 +302,9 @@ class MemorySanitizer : public FunctionPass {
   /// \brief Thread-local shadow storage for in-register va_arg function
   /// parameters (x86_64-specific).
   GlobalVariable *VAArgTLS;
+  /// \brief Thread-local shadow storage for va_args
+  /// (mips64-specific).
+  GlobalVariable *VAArgSizeTLS;
   /// \brief Thread-local shadow storage for va_arg overflow area
   /// (x86_64-specific).
   GlobalVariable *VAArgOverflowSizeTLS;
@@ -337,6 +340,7 @@ class MemorySanitizer : public FunctionPass {
 
   friend struct MemorySanitizerVisitor;
   friend struct VarArgAMD64Helper;
+  friend struct VarArgMIPS64Helper;
 };
 }  // namespace
 
@@ -430,7 +434,7 @@ void MemorySanitizer::initializeCallbacks(Module &M) {
     M, ArrayType::get(IRB.getInt64Ty(), kParamTLSSize / 8), false,
     GlobalVariable::ExternalLinkage, nullptr, "__msan_va_arg_tls", nullptr,
     GlobalVariable::InitialExecTLSModel);
-  VAArgOverflowSizeTLS = new GlobalVariable(
+  VAArgOverflowSizeTLS = VAArgSizeTLS = new GlobalVariable(
     M, IRB.getInt64Ty(), false, GlobalVariable::ExternalLinkage, nullptr,
     "__msan_va_arg_overflow_size_tls", nullptr,
     GlobalVariable::InitialExecTLSModel);
@@ -2859,6 +2863,103 @@ struct VarArgAMD64Helper : public VarArgHelper {
   }
 };
 
+/// \brief MIPS64-specific implementation of VarArgHelper.
+struct VarArgMIPS64Helper : public VarArgHelper {
+  Function &F;
+  MemorySanitizer &MS;
+  MemorySanitizerVisitor &MSV;
+  Value *VAArgTLSCopy;
+  Value *VAArgSize;
+
+  SmallVector<CallInst*, 16> VAStartInstrumentationList;
+
+  VarArgMIPS64Helper(Function &F, MemorySanitizer &MS,
+                    MemorySanitizerVisitor &MSV)
+    : F(F), MS(MS), MSV(MSV), VAArgTLSCopy(nullptr),
+      VAArgSize(nullptr) {}
+
+  void visitCallSite(CallSite &CS, IRBuilder<> &IRB) override {
+    unsigned VAArgOffset = 0;
+
+    for (CallSite::arg_iterator ArgIt = CS.arg_begin() + 1, End = CS.arg_end();
+         ArgIt != End; ++ArgIt) {
+      Value *A = *ArgIt;
+      Value *Base;
+      uint64_t ArgSize = MS.DL->getTypeAllocSize(A->getType());
+      Base = getShadowPtrForVAArgument(A->getType(), IRB, VAArgOffset);
+      VAArgOffset += RoundUpToAlignment(ArgSize, 8);
+      IRB.CreateAlignedStore(MSV.getShadow(A), Base, kShadowTLSAlignment);
+    }
+
+    Constant *TotalVAArgSize = ConstantInt::get(IRB.getInt64Ty(), VAArgOffset);
+    IRB.CreateStore(TotalVAArgSize, MS.VAArgSizeTLS);
+  }
+
+  /// \brief Compute the shadow address for a given va_arg.
+  Value *getShadowPtrForVAArgument(Type *Ty, IRBuilder<> &IRB,
+                                   int ArgOffset) {
+    Value *Base = IRB.CreatePointerCast(MS.VAArgTLS, MS.IntptrTy);
+    Base = IRB.CreateAdd(Base, ConstantInt::get(MS.IntptrTy, ArgOffset));
+    return IRB.CreateIntToPtr(Base, PointerType::get(MSV.getShadowTy(Ty), 0),
+                              "_msarg");
+  }
+
+  void visitVAStartInst(VAStartInst &I) override {
+    IRBuilder<> IRB(&I);
+    VAStartInstrumentationList.push_back(&I);
+    Value *VAListTag = I.getArgOperand(0);
+    Value *ShadowPtr = MSV.getShadowPtr(VAListTag, IRB.getInt8Ty(), IRB);
+    IRB.CreateMemSet(ShadowPtr, Constant::getNullValue(IRB.getInt8Ty()),
+                     /* size */8, /* alignment */8, false);
+  }
+
+  void visitVACopyInst(VACopyInst &I) override {
+    IRBuilder<> IRB(&I);
+    Value *VAListTag = I.getArgOperand(0);
+    Value *ShadowPtr = MSV.getShadowPtr(VAListTag, IRB.getInt8Ty(), IRB);
+    // Unpoison the whole __va_list_tag.
+    // FIXME: magic ABI constants.
+    IRB.CreateMemSet(ShadowPtr, Constant::getNullValue(IRB.getInt8Ty()),
+                     /* size */8, /* alignment */8, false);
+  }
+
+  void finalizeInstrumentation() override {
+    assert(!VAArgSize && !VAArgTLSCopy &&
+           "finalizeInstrumentation called twice");
+    IRBuilder<> IRB(F.getEntryBlock().getFirstNonPHI());
+    VAArgSize = IRB.CreateLoad(MS.VAArgSizeTLS);
+    Value *CopySize = IRB.CreateAdd(ConstantInt::get(MS.IntptrTy, 0),
+                                    VAArgSize);
+
+    if (!VAStartInstrumentationList.empty()) {
+      // If there is a va_start in this function, make a backup copy of
+      // va_arg_tls somewhere in the function entry block.
+      VAArgTLSCopy = IRB.CreateAlloca(Type::getInt8Ty(*MS.C), CopySize);
+      IRB.CreateMemCpy(VAArgTLSCopy, MS.VAArgTLS, CopySize, 8);
+    }
+
+    // Instrument va_start.
+    // Copy va_list shadow from the backup copy of the TLS contents.
+    for (size_t i = 0, n = VAStartInstrumentationList.size(); i < n; i++) {
+      CallInst *OrigInst = VAStartInstrumentationList[i];
+      IRBuilder<> IRB(OrigInst->getNextNode());
+
+      Value *VAListTag = OrigInst->getArgOperand(0);
+      Value *RegSaveAreaPtrPtr =
+        IRB.CreateIntToPtr(
+          IRB.CreateAdd(IRB.CreatePtrToInt(VAListTag, MS.IntptrTy),
+                        ConstantInt::get(MS.IntptrTy, 0)),
+                        Type::getInt64PtrTy(*MS.C));
+      Value *RegSaveAreaPtr = IRB.CreateLoad(RegSaveAreaPtrPtr);
+      Value *RegSaveAreaShadowPtr =
+      MSV.getShadowPtr(RegSaveAreaPtr, IRB.getInt8Ty(), IRB);
+      IRB.CreateMemCpy(RegSaveAreaShadowPtr, VAArgTLSCopy, CopySize, 8);
+      }
+    }
+};
+
+
+
 /// \brief A no-op implementation of VarArgHelper.
 struct VarArgNoOpHelper : public VarArgHelper {
   VarArgNoOpHelper(Function &F, MemorySanitizer &MS,
@@ -2880,6 +2981,8 @@ VarArgHelper *CreateVarArgHelper(Function &Func, MemorySanitizer &Msan,
   llvm::Triple TargetTriple(Func.getParent()->getTargetTriple());
   if (TargetTriple.getArch() == llvm::Triple::x86_64)
     return new VarArgAMD64Helper(Func, Msan, Visitor);
+  else if (TargetTriple.getArch() == llvm::Triple::mipsel64)
+    return new VarArgMIPS64Helper(Func, Msan, Visitor);
   else
     return new VarArgNoOpHelper(Func, Msan, Visitor);
 }
