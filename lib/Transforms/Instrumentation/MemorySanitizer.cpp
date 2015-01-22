@@ -225,6 +225,14 @@ static const MemoryMapParams Linux_X86_64_MemoryMapParams = {
   0x200000000000,  // OriginBase
 };
 
+// mips32 Linux
+static const MemoryMapParams Linux_MIPS32_MemoryMapParams = {
+  0x000040000000,  // AndMask
+  0,               // XorMask (not used)
+  0,               // ShadowBase (not used)
+  0x000020000000,  // OriginBase
+};
+
 // mips64 Linux
 static const MemoryMapParams Linux_MIPS64_MemoryMapParams = {
   0x004000000000,  // AndMask
@@ -255,7 +263,7 @@ static const PlatformMemoryMapParams Linux_X86_MemoryMapParams = {
 };
 
 static const PlatformMemoryMapParams Linux_MIPS_MemoryMapParams = {
-  NULL,
+  &Linux_MIPS32_MemoryMapParams,
   &Linux_MIPS64_MemoryMapParams,
 };
 
@@ -478,6 +486,10 @@ bool MemorySanitizer::doInitialization(Module &M) {
           break;
         case Triple::x86:
           MapParams = Linux_X86_MemoryMapParams.bits32;
+          break;
+        case Triple::mips:
+        case Triple::mipsel:
+          MapParams = Linux_MIPS_MemoryMapParams.bits32;
           break;
         case Triple::mips64:
         case Triple::mips64el:
